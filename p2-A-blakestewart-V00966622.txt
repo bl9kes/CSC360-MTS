@@ -1,0 +1,144 @@
+Blake Stewart - v00966622
+CSC360: Operating Systems
+P2 - Deliverable A
+
+
+4.2. Deliverable A (Design Due: Oct 17, 2025), 2.5%
+
+You will write a design document which answers the following questions. It is recommended that you think through the following questions very carefully before answering them.
+Unlike P1, no amount of debugging will help after the basic design has been coded. Therefore, it is very important to ensure that the basic design is correct. Answering the following questions haphazardly will basically ensure that Deliverable B does not work.
+So think about the following for a few days and then write down the answers.
+
+
+
+How many threads are you going to use? Specify the work that you intend each thread to perform.
+
+    The design will have N + 2 threads.
+
+    We will have one main thread, one controller/dispatcher thread and N train threads.
+
+    Main Thread:
+        This thread will be used to parse input, initialize global variables, spawn new threads, join trains, stop/join dispatcher, and cleanup.
+
+    Dispatcher Thread:
+        This thread will be used to choose which train will be sent across the single-track section. Responsible for enforcing priority, tie-breaking, direction, and fairness rules.
+        The dispatcher blocks when the track is occupied or no trains are ready, re-checks the condition in a while loop, selects the next train, signals the chosen train's convar, and waits for the track to become available again.
+
+    N Train Threads:
+        Load trains, mark ready and enter queue, wait on convar, cross track, update track status, update metadata, and signal dispatcher.
+
+
+
+Do the threads work independently? Or, is there an overall "controller" thread?
+
+    No, the threads do not work independently. There will be a dedicated dispatcher or controller thread that controls the single track.
+    Trains never schedule themselves, they only signal readiness and wait for permission from the dispatcher.
+        - Centralized control enforces the crossing policies.
+        - Simplifies the coordination, as a single thread decides who crosses next.
+
+
+
+How many mutexes are you going to use? Specify the operation that each mutex will guard.
+
+    There will be two mutexes being used, one for core scheduling and one for logging data.
+
+    Core Scheduling Mutex: mutex_ready
+        - Guards all the scheduling states, including ready queues, track occupancy, remaining train counter, last direction of train, same direction streak, and per-train granted flag.
+        - All queue inserts/removes, and all condition checks associated with the dispatcher's decisions are performed while holding this mutex.
+
+    Logging Mutex: mutex_log
+        - Serializes writes to stdout and output.txt to ensure lines do not interleave.
+        - Not necessary but good practice and helps maintain clean output.
+
+
+
+Will the main thread be idle? If not, what will it be doing?
+
+    No, the main thread will NOT be idle.
+    After spawning the dispatcher and all trains, the main thread joins all trains, helps the dispatcher terminate, closes files, and exits.
+
+
+
+How are you going to represent stations (which are collections of loaded trains ready to depart)? That is, what type of data structure will you use?
+
+    Stations will be represented as four ready queues by direction and priority:
+        - (West, High), (West, Low), (East, High) and (East, Low).
+
+    Each queue will be a sorted linked list:
+        - Maintain the list sorted by loaded_time, then train_id (input order).
+        - Preserves "finish loading first wins, if tied, earlier input order wins rule."
+        - Removal (pop) is O(1).
+        - Individual linked list for high and low queues makes checking type simple and keeps pop at O(1).
+        - Allows for tie-breaking and easy priority enforcement.
+
+
+
+How are you going to ensure that data structures in your program will not be modified concurrently?
+
+    To ensure that the data structures in the program will not be modified concurrently, all queue operations and scheduler metadata updates will happen under the ready mutex (mutex_ready).
+        -  Trains insert under the lock and the dispatcher removes under lock.
+
+
+
+How many convars are you going to use? For each convar:
+
+    There will be two types of convars: one global (convar_ready) and one per train (convar_go[i]).
+        - Convar_ready is shared by all threads.
+        - Convar_go[i] is one conditional variable inside each train (total of N).
+
+    Describe the condition that the convar will represent.
+
+        - convar_ready represents the scheduling-state change, when a train becomes ready to send or the track is free.
+            * Fired when any train becomes ready or when the track becomes free.
+
+        - convar_go[i] represents the train i has been selected to traverse the main track, where i is the specific train to be sent across.
+            * Fired only for the chosen train i, other trains remain waiting.
+
+    Which mutex is associated with the convar? Why?
+
+        Both convar_ready and all convar_go[i] are associated with mutex_ready.
+            - Using one shared mutex is beneficial as it prevents races between queue mutations, last crossed direction, and train granted flags.
+            - The check-wait-recheck cycle only works if the predicate and wait share the same lock.
+
+    What operation should be performed once pthread_cond_wait() has been unblocked and re-acquired the mutex?
+
+        Once pthread_cond_wait() has been unblocked and re-acquired the mutex, we must re-check the predicate in a while loop and proceed with the required action.
+            - For convar_ready: re-test to check if track is free and some train is ready,
+                if true, select next train and set granted flag and signal the train's convar_go[i].
+            - For convar_go[i]: re-test to check if the train's granted flag is true,
+                if true, send the train and exit upon crossing, update the track status, current direction, direction streak, and signal convar_ready.
+
+
+
+
+Briefly sketch the overall algorithm you will use. You may use sentences such as:
+If train is loaded, get station mutex, put into queue, release station mutex.
+
+    Initialization:
+        - First, we will parse the input, record the direction, priority, load, and cross for each train.
+        - Initialize mutex_ready, convar_ready and convar_go[i].
+        - Set the remaining trains variable = N (# of trains), update the status of the track and number of trains crossed.
+        - Start the dispatcher thread, then start all train threads at time 0.
+
+    For train threads:
+        - Sleep to simulate its loading time.
+        - If a train is loaded, get station mutex, put into queue, log ready, signal convar_ready and wait on convar_go[i] in a while loop.
+        - When signaled and conditions hold, log ON, sleep, then log OFF.
+        - Lock, update track status to free, update last crossed direction and same direction streak, decrement remaining trains, signal convar_ready, unlock, exit.
+
+    Dispatcher:
+        - Lock, while track not free or no trains ready, wait on convar_ready.
+        - Select next train using priority and scheduling rules as described in assignment description (rules: high > low, opposite direction, west first, etc.).
+        - After two consecutive crossings in the same direction, if any trains are waiting to go the opposite direction, dispatch from the opposite direction next.
+        - Identify the chosen next train to cross by setting granted flag, update track status, signal the chosen train's convar_go[i], unlock.
+        - Repeat previous steps until no more remaining trains, then exit.
+
+    Shutdown:
+        - Join all train threads, join dispatcher, close files, and return.
+
+
+
+The design counts for 2.5%.
+Please write your answers of the above questions in plain text format in a single file named p2-A-<netlink_id>-V#.txt and commit it to your p2 repository root folder.
+
+Feedback: Please make sure it can handle different train priorities, different loading times and directions, and avoid deadlocks. +2.5
